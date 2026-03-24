@@ -2,9 +2,9 @@ name: 노션 → WordPress 자동 발행
 
 on:
   schedule:
-    # 한국시간 기준 오전 9시 ~ 자정, 매 30분마다 실행
-    # (UTC 00:00~15:00 = KST 09:00~00:00)
-    - cron: '*/30 0-15 * * *'
+    # 매 5분마다 실행 (GitHub Actions 허용 최소 주기)
+    # ⚠️ GitHub 부하에 따라 실제 실행은 최대 30~60분 지연될 수 있음
+    - cron: '*/5 * * * *'
 
   workflow_dispatch:  # GitHub 웹에서 수동 실행 버튼
 
