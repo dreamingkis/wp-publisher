@@ -1,0 +1,36 @@
+name: 노션 → WordPress 자동 발행
+
+on:
+  schedule:
+    # 한국시간 기준 오전 9시 ~ 자정, 매 30분마다 실행
+    # (UTC 00:00~15:00 = KST 09:00~00:00)
+    - cron: '*/30 0-15 * * *'
+
+  workflow_dispatch:  # GitHub 웹에서 수동 실행 버튼
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 노션 → WP 발행 실행
+        run: python notion_wp_publisher.py
+        env:
+          NOTION_TOKEN:    ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID:    ${{ secrets.NOTION_DB_ID }}
+          WP_URL:          ${{ secrets.WP_URL }}
+          WP_USER:         ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
