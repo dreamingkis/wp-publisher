@@ -82,7 +82,7 @@ POST_TYPE_CONFIG = {
             "교육대상": "pf_target",
             "참여인원": "pf_people",
             "진행시간": "pf_time",
-            "프로젝트 기간": "pf_period",
+            "일시": "pf_period",
         },
     },
 }
