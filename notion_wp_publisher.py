@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-🚀 노션 → 워드프레스 자동 발행 시스템 v3 (bestar.kr 전용)
+🚀 노션 → 워드프레스 자동 발행 시스템 v4 (bestar.kr 전용)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v3 대비 변경점:
+  ✅ 포트폴리오(CPT) 자동 발행 지원
+  ✅ 노션 DB '발행타입' 속성으로 블로그/포트폴리오 분기
+  ✅ CPT별 카테고리/태그 택소노미 자동 매핑
+  ✅ POST_TYPE_CONFIG로 확장 가능한 구조
+
 트리거: 노션 DB "상태"가 "원고작성완료"인 글 자동 감지
-기능:   ✅ WP 자동 발행
+기능:   ✅ WP 자동 발행 (블로그 + 포트폴리오)
         ✅ 대표이미지(썸네일) 자동 설정
         ✅ SEO 메타 자동 생성 (Yoast/RankMath)
         ✅ 카테고리/태그 병렬 처리
@@ -14,9 +20,9 @@
         ✅ 로그 파일 저장 (publisher.log)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 실행 방법:
-  python notion_wp_publisher.py             # 1회 실행
-  python notion_wp_publisher.py --watch     # 상시 자동 감시 (5분 간격)
-  python notion_wp_publisher.py --dry-run   # 실제 발행 없이 동작 확인
+  python notion_wp_publisher.py              # 1회 실행
+  python notion_wp_publisher.py --watch      # 상시 자동 감시 (5분 간격)
+  python notion_wp_publisher.py --dry-run    # 실제 발행 없이 동작 확인
 """
 
 import sys
@@ -39,24 +45,48 @@ load_dotenv()
 # ─────────────────────────────
 # ✅ 설정값 (.env 또는 환경변수에서 로드)
 # ─────────────────────────────
-NOTION_TOKEN    = os.environ["NOTION_TOKEN"]
-NOTION_DB_ID    = os.environ.get("NOTION_DB_ID",    "2aaa9a5b-4f04-80d6-a036-e3abb5c18802")
-WP_URL          = os.environ.get("WP_URL",           "https://bestar.kr")
-WP_USER         = os.environ.get("WP_USER",          "bestarkr")
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "2aaa9a5b-4f04-80d6-a036-e3abb5c18802")
+WP_URL = os.environ.get("WP_URL", "https://bestar.kr")
+WP_USER = os.environ.get("WP_USER", "bestarkr")
 WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 
 TRIGGER_STATUS = "원고작성완료"
-DONE_STATUS    = "홈페이지 발행 완료"
-FAIL_STATUS    = "발행실패"
+DONE_STATUS = "홈페이지 발행 완료"
+FAIL_STATUS = "발행실패"
 CHECK_INTERVAL = 300  # 5분
+
+# ─────────────────────────────
+# ✅ v4 신규: 포스트 타입별 설정
+# ─────────────────────────────
+# 노션 DB의 '발행타입' 속성값 → WP REST API 엔드포인트 매핑
+# 새로운 CPT를 추가하려면 여기에 항목만 추가하면 됩니다.
+POST_TYPE_CONFIG = {
+    "블로그": {
+        "endpoint": "/wp-json/wp/v2/posts",
+        "category_taxonomy": "categories",      # WP REST API 택소노미 슬러그
+        "tag_taxonomy": "tags",
+        "notion_category_prop": "카테고리",       # 노션 DB 속성명
+        "notion_tag_prop": "태그",
+    },
+    "포트폴리오": {
+        "endpoint": "/wp-json/wp/v2/portfolio",
+        "category_taxonomy": "portfolio_cat",
+        "tag_taxonomy": "portfolio_tag",
+        "notion_category_prop": "포트폴리오 카테고리",  # 노션 DB 속성명
+        "notion_tag_prop": "포트폴리오 태그",
+    },
+}
+
+# 발행타입이 지정되지 않은 경우 기본값
+DEFAULT_POST_TYPE = "블로그"
 
 CATEGORY_MAP = {
     # 노션 카테고리명: WP 카테고리명이 다를 때만 기입
-    # (같으면 없어도 되지만, WP 쪽 이름이 바뀔 때를 대비해 명시)
     "갤럽 강점테마": "갤럽 강점테마",
-    "강점활용":      "강점활용",
-    "브랜딩 전략":   "브랜딩 전략",
-    "퍼스널브랜딩":  "퍼스널브랜딩",
+    "강점활용": "강점활용",
+    "브랜딩 전략": "브랜딩 전략",
+    "퍼스널브랜딩": "퍼스널브랜딩",
 }
 
 # WP 인증 토큰 (모듈 로드 시 1회만 계산)
@@ -87,12 +117,13 @@ def wp_headers(content_type="application/json"):
 # ─────────────────────────────
 def upload_featured_image(image_url: str, title: str) -> int | None:
     try:
-        log.info("  🖼️  대표이미지 다운로드 중...")
+        log.info("  🖼️ 대표이미지 다운로드 중...")
         res = requests.get(image_url, timeout=30)
         res.raise_for_status()
         content_type = res.headers.get("Content-Type", "image/jpeg").split(";")[0]
         ext = (mimetypes.guess_extension(content_type) or ".jpg").replace(".jpe", ".jpg")
         filename = re.sub(r"[^\w가-힣]", "_", title)[:50] + ext
+
         upload_res = requests.post(
             f"{WP_URL}/wp-json/wp/v2/media",
             headers={
@@ -108,7 +139,7 @@ def upload_featured_image(image_url: str, title: str) -> int | None:
         log.info(f"  ✅ 대표이미지 업로드 완료 (미디어 ID: {media_id})")
         return media_id
     except Exception as e:
-        log.warning(f"  ⚠️  대표이미지 업로드 실패 (건너뜀): {e}")
+        log.warning(f"  ⚠️ 대표이미지 업로드 실패 (건너뜀): {e}")
         return None
 
 
@@ -138,7 +169,7 @@ def get_or_create_wp_term(taxonomy: str, name: str) -> int | None:
         res.raise_for_status()
         return res.json()["id"]
     except Exception as e:
-        log.warning(f"  ⚠️  태그/카테고리 처리 실패 ({name}): {e}")
+        log.warning(f"  ⚠️ 태그/카테고리 처리 실패 ({name}): {e}")
         return None
 
 
@@ -156,7 +187,7 @@ def rich_text_to_html(rich_texts: list) -> str:
         if ann.get("code"):          text = f"<code>{text}</code>"
         if ann.get("strikethrough"): text = f"<s>{text}</s>"
         link = rt.get("href")
-        if link:                     text = f'<a href="{link}" target="_blank">{text}</a>'
+        if link: text = f'<a href="{link}" target="_blank">{text}</a>'
         result += text
     return result
 
@@ -203,34 +234,27 @@ def blocks_to_html(blocks: list, notion: Client) -> str:
         if btype == "paragraph":
             if text.strip():
                 html_parts.append(f"<p>{text}</p>")
-
         elif btype in ("heading_1", "heading_2", "heading_3"):
             lvl = btype[-1]
             html_parts.append(f"<h{lvl}>{text}</h{lvl}>")
-
         elif btype == "bulleted_list_item":
             if list_type != "ul":
                 flush_list()
-                list_type = "ul"
+            list_type = "ul"
             list_buffer.append(text)
-
         elif btype == "numbered_list_item":
             if list_type != "ol":
                 flush_list()
-                list_type = "ol"
+            list_type = "ol"
             list_buffer.append(text)
-
         elif btype == "quote":
             html_parts.append(f"<blockquote><p>{text}</p></blockquote>")
-
         elif btype == "divider":
             html_parts.append("<hr/>")
-
         elif btype == "code":
             code = bdata.get("rich_text", [{}])[0].get("plain_text", "")
             lang = bdata.get("language", "")
             html_parts.append(f'<pre><code class="language-{lang}">{code}</code></pre>')
-
         elif btype == "table":
             rows = fetch_all_blocks(notion, block["id"])
             html_parts.append("<table>")
@@ -242,7 +266,6 @@ def blocks_to_html(blocks: list, notion: Client) -> str:
                     html_parts.append(f"  <{tag}>{rich_text_to_html(cell)}</{tag}>")
                 html_parts.append("</tr>")
             html_parts.append("</table>")
-
         elif btype == "image":
             url = (bdata.get("file") or bdata.get("external") or {}).get("url", "")
             cap = rich_text_to_html(bdata.get("caption", []))
@@ -251,13 +274,10 @@ def blocks_to_html(blocks: list, notion: Client) -> str:
                 if cap:
                     html_parts.append(f"<figcaption>{cap}</figcaption>")
                 html_parts.append("</figure>")
-
         elif btype == "callout":
             icon = bdata.get("icon", {}).get("emoji", "💡")
             html_parts.append(f'<div class="callout"><span>{icon}</span><div>{text}</div></div>')
-
         elif btype == "toggle":
-            # 자식 블록 재귀 렌더링
             children_html = ""
             if has_children:
                 children = fetch_all_blocks(notion, block["id"])
@@ -278,13 +298,8 @@ def notion_blocks_to_html(notion: Client, page_id: str) -> tuple[str, list]:
 # ❓ FAQ 스키마 자동 생성
 # ─────────────────────────────
 def extract_faq_schema(blocks: list) -> str:
-    """
-    Q./A. 패턴 감지 → FAQ JSON-LD 스키마 생성
-    지원 패턴: Q1. / Q. / Q: 로 시작하는 단락
-    """
     faq_items = []
     current_q = None
-
     for block in blocks:
         if block["type"] not in ("paragraph", "heading_1", "heading_2", "heading_3"):
             continue
@@ -292,7 +307,6 @@ def extract_faq_schema(blocks: list) -> str:
         text = "".join(rt.get("plain_text", "") for rt in bdata.get("rich_text", [])).strip()
         if not text:
             continue
-
         if re.match(r"^Q\d*[.:]\s+", text, re.IGNORECASE):
             current_q = re.sub(r"^Q\d*[.:]\s+", "", text, flags=re.IGNORECASE).strip()
         elif re.match(r"^A[.:]\s+", text, re.IGNORECASE) and current_q:
@@ -339,17 +353,48 @@ def generate_seo_meta(title: str, content_html: str, meta_desc_input: str = "", 
 
 
 # ─────────────────────────────
-# 📤 WP 발행
+# ✅ v4 신규: 발행타입 결정 헬퍼
+# ─────────────────────────────
+def get_post_type_from_page(props: dict) -> str:
+    """노션 페이지 속성에서 발행타입을 읽어옵니다.
+    
+    '발행타입' Select 속성이 있으면 그 값을 사용하고,
+    없으면 DEFAULT_POST_TYPE (블로그)를 반환합니다.
+    """
+    post_type_prop = props.get("발행타입", {})
+    select_val = post_type_prop.get("select")
+    if select_val and select_val.get("name"):
+        pt = select_val["name"]
+        if pt in POST_TYPE_CONFIG:
+            return pt
+        else:
+            log.warning(f"  ⚠️ 알 수 없는 발행타입 '{pt}' → 기본값 '{DEFAULT_POST_TYPE}' 사용")
+    return DEFAULT_POST_TYPE
+
+
+# ─────────────────────────────
+# 📤 WP 발행 (v4: 포스트 타입 분기)
 # ─────────────────────────────
 def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
     props = page.get("properties", {})
     page_id = page["id"]
 
     title = "".join(rt["plain_text"] for rt in props.get("이름", {}).get("title", []))
-    cat_name = ((props.get("카테고리") or {}).get("select") or {}).get("name", "")
+
+    # ── v4: 발행타입 결정 → 설정 로드 ──
+    post_type = get_post_type_from_page(props)
+    pt_config = POST_TYPE_CONFIG[post_type]
+    endpoint = pt_config["endpoint"]
+    cat_taxonomy = pt_config["category_taxonomy"]
+    tag_taxonomy = pt_config["tag_taxonomy"]
+    notion_cat_prop = pt_config["notion_category_prop"]
+    notion_tag_prop = pt_config["notion_tag_prop"]
+
+    # ── 발행타입에 맞는 노션 속성에서 카테고리/태그 읽기 ──
+    cat_name = ((props.get(notion_cat_prop) or {}).get("select") or {}).get("name", "")
     wp_cat = CATEGORY_MAP.get(cat_name, cat_name)
 
-    kw_items = (props.get("태그") or {}).get("multi_select", [])
+    kw_items = (props.get(notion_tag_prop) or {}).get("multi_select", [])
     tag_names = [kw["name"] for kw in kw_items]
     if "강점" in cat_name:
         tag_names += ["갤럽강점", "CliftonStrengths", "강점코칭"]
@@ -363,7 +408,9 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
     ).strip()
 
     log.info(f"  📝 블록 변환 중: {title}")
+    log.info(f"  📦 발행타입: {post_type} → {endpoint}")
     content_html, blocks = notion_blocks_to_html(notion, page_id)
+
     seo = generate_seo_meta(title, content_html, meta_desc_input, focus_kw_input)
     log.info(f"  🔍 SEO 키워드: {seo['focus_keyword']}")
 
@@ -373,14 +420,15 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
     if thumb_url and not dry_run:
         featured_media_id = upload_featured_image(thumb_url, title)
     elif not thumb_url:
-        log.info("  ℹ️  대표이미지 없음")
+        log.info("  ℹ️ 대표이미지 없음")
 
-    # 카테고리/태그 병렬 조회·생성
+    # 카테고리/태그 병렬 조회·생성 (v4: 택소노미 동적 매핑)
     cat_id, tag_ids = None, []
     if not dry_run:
         with ThreadPoolExecutor(max_workers=8) as executor:
-            cat_future = executor.submit(get_or_create_wp_term, "categories", wp_cat) if wp_cat else None
-            tag_futures = [executor.submit(get_or_create_wp_term, "tags", t) for t in tag_names]
+            cat_future = executor.submit(get_or_create_wp_term, cat_taxonomy, wp_cat) if wp_cat else None
+            tag_futures = [executor.submit(get_or_create_wp_term, tag_taxonomy, t) for t in tag_names]
+
             if cat_future:
                 cat_id = cat_future.result()
             tag_ids = [r for f in tag_futures if (r := f.result()) is not None]
@@ -388,27 +436,33 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
     faq_schema = extract_faq_schema(blocks)
     final_content = content_html + faq_schema if faq_schema else content_html
 
+    # ── v4: 포스트 데이터 구성 (택소노미 키 동적) ──
     post_data = {
-        "title":      title,
-        "content":    final_content,
-        "status":     "publish",
-        "categories": [cat_id] if cat_id else [],
-        "tags":       tag_ids,
+        "title": title,
+        "content": final_content,
+        "status": "publish",
         "meta": {
-            "_yoast_wpseo_metadesc":   seo["meta_description"],
-            "_yoast_wpseo_focuskw":    seo["focus_keyword"],
-            "rank_math_description":   seo["meta_description"],
+            "_yoast_wpseo_metadesc": seo["meta_description"],
+            "_yoast_wpseo_focuskw": seo["focus_keyword"],
+            "rank_math_description": seo["meta_description"],
             "rank_math_focus_keyword": seo["focus_keyword"],
         },
     }
+
+    # 카테고리/태그 키 이름이 post_type에 따라 다름
+    if cat_id:
+        post_data[cat_taxonomy] = [cat_id]
+    if tag_ids:
+        post_data[tag_taxonomy] = tag_ids
+
     if featured_media_id:
         post_data["featured_media"] = featured_media_id
 
     if dry_run:
-        log.info(f"  [DRY-RUN] 발행 생략 — 제목: {title}, 카테고리: {wp_cat}, 태그: {tag_names}")
+        log.info(f"  [DRY-RUN] 발행 생략 — 제목: {title}, 발행타입: {post_type}, 카테고리: {wp_cat}, 태그: {tag_names}")
         return {"link": "https://dry-run.local/"}
 
-    res = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", headers=wp_headers(), json=post_data)
+    res = requests.post(f"{WP_URL}{endpoint}", headers=wp_headers(), json=post_data)
     res.raise_for_status()
     return res.json()
 
@@ -451,20 +505,23 @@ def run_once(notion: Client, dry_run: bool = False) -> None:
         title = "".join(rt["plain_text"] for rt in page["properties"].get("이름", {}).get("title", []))
         page_id = page["id"]
         log.info(f"\n▶ 처리 중: {title}")
+
         try:
             wp_post = publish_to_wp(page, notion, dry_run=dry_run)
             wp_url = wp_post["link"]
             log.info(f"  ✅ WP 발행 완료: {wp_url}")
+
             if not dry_run:
                 update_notion_status(notion, page_id, DONE_STATUS, wp_url)
                 log.info(f"  ✅ 노션 상태 → '{DONE_STATUS}' 업데이트 완료")
             success += 1
+
         except Exception as e:
             log.error(f"  ❌ 오류 발생: {e}", exc_info=True)
             if not dry_run:
                 try:
                     update_notion_status(notion, page_id, FAIL_STATUS)
-                    log.info(f"  ⚠️  노션 상태 → '{FAIL_STATUS}' 표시 완료")
+                    log.info(f"  ⚠️ 노션 상태 → '{FAIL_STATUS}' 표시 완료")
                 except Exception:
                     pass
             fail += 1
@@ -473,8 +530,8 @@ def run_once(notion: Client, dry_run: bool = False) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="노션 → WP 자동 발행 v3")
-    parser.add_argument("--watch",   action="store_true", help="상시 감시 모드 (5분 간격)")
+    parser = argparse.ArgumentParser(description="노션 → WP 자동 발행 v4 (포트폴리오 지원)")
+    parser.add_argument("--watch", action="store_true", help="상시 감시 모드 (5분 간격)")
     parser.add_argument("--dry-run", action="store_true", help="실제 발행 없이 동작 확인")
     args = parser.parse_args()
 
@@ -485,7 +542,7 @@ def main():
 
     if args.watch:
         log.info(f"👀 상시 감시 모드 시작 (매 {CHECK_INTERVAL // 60}분 체크)")
-        log.info("   종료하려면 Ctrl + C")
+        log.info("  종료하려면 Ctrl + C")
         while True:
             try:
                 run_once(notion, dry_run=args.dry_run)
