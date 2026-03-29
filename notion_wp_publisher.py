@@ -68,13 +68,22 @@ POST_TYPE_CONFIG = {
         "tag_taxonomy": "tags",
         "notion_category_prop": "카테고리",       # 노션 DB 속성명
         "notion_tag_prop": "태그",
+        "acf_fields": {},                        # 블로그에는 ACF 필드 없음
     },
     "포트폴리오": {
         "endpoint": "/wp-json/wp/v2/portfolio",
         "category_taxonomy": "portfolio_cat",
         "tag_taxonomy": "portfolio_tag",
-        "notion_category_prop": "포트폴리오 카테고리",  # 노션 DB 속성명
+        "notion_category_prop": "포트폴리오 카테고리",
         "notion_tag_prop": "포트폴리오 태그",
+        "acf_fields": {
+            # 노션 속성명: WP ACF 필드명
+            "클라이언트": "pf_client",
+            "교육대상": "pf_target",
+            "참여인원": "pf_people",
+            "진행시간": "pf_time",
+            "프로젝트 기간": "pf_period",
+        },
     },
 }
 
@@ -457,6 +466,21 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
 
     if featured_media_id:
         post_data["featured_media"] = featured_media_id
+
+    # ── v4: ACF 커스텀 필드 처리 ──
+    acf_fields = pt_config.get("acf_fields", {})
+    if acf_fields:
+        acf_data = {}
+        for notion_prop, wp_field in acf_fields.items():
+            value = "".join(
+                rt.get("plain_text", "")
+                for rt in ((props.get(notion_prop) or {}).get("rich_text") or [])
+            ).strip()
+            if value:
+                acf_data[wp_field] = value
+        if acf_data:
+            post_data["acf"] = acf_data
+            log.info(f"  📋 ACF 필드: {acf_data}")
 
     if dry_run:
         log.info(f"  [DRY-RUN] 발행 생략 — 제목: {title}, 발행타입: {post_type}, 카테고리: {wp_cat}, 태그: {tag_names}")
