@@ -545,8 +545,12 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False, existing_po
     seo = generate_seo_meta(title, content_html, meta_desc_input, focus_kw_input)
     log.info(f"  🔍 SEO 키워드: {seo['focus_keyword']}")
 
-    # 대표이미지 (1순위: DB URL 필드, 2순위: 본문 첫 이미지)
-    thumb_url = ((props.get("대표이미지") or {}).get("url") or "") or extract_first_image_url(blocks)
+    # 대표이미지 (1순위: DB URL 필드, 2순위: 본문 첫 이미지 — HTML에서 추출하여 중첩 블록도 감지)
+    thumb_url = (props.get("대표이미지") or {}).get("url") or ""
+    if not thumb_url:
+        img_match = re.search(r'<img\s+[^>]*src="([^"]+)"', content_html)
+        if img_match:
+            thumb_url = img_match.group(1)
     featured_media_id = None
     if thumb_url and not dry_run:
         featured_media_id = upload_featured_image(thumb_url, title)
