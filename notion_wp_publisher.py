@@ -54,6 +54,7 @@ WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 TRIGGER_STATUS = "원고작성완료"
 DONE_STATUS = "홈페이지 발행 완료"
 FAIL_STATUS = "발행실패"
+REPUBLISH_STATUS = "재발행"
 CHECK_INTERVAL = 300  # 5분
 
 # ─────────────────────────────
@@ -461,9 +462,47 @@ def get_post_type_from_page(props: dict) -> str:
 
 
 # ─────────────────────────────
-# 📤 WP 발행 (v4: 포스트 타입 분기)
+# 🔄 WP 기존 포스트 ID 조회 (재발행용)
 # ─────────────────────────────
-def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
+def resolve_wp_post_id(wp_url: str, endpoint: str) -> int | None:
+    """워드프레스 URL에서 기존 포스트 ID를 조회합니다."""
+    from urllib.parse import urlparse, parse_qs
+
+    parsed = urlparse(wp_url)
+
+    # Case 1: ?p=123 형식
+    qs = parse_qs(parsed.query)
+    if "p" in qs:
+        try:
+            return int(qs["p"][0])
+        except (ValueError, IndexError):
+            pass
+
+    # Case 2: /slug/ 형식 → REST API로 슬러그 기반 조회
+    path = parsed.path.strip("/")
+    slug = path.split("/")[-1] if path else ""
+
+    if slug:
+        try:
+            res = requests.get(
+                f"{WP_URL}{endpoint}",
+                params={"slug": slug, "status": "publish,draft,pending,private"},
+                headers=wp_headers(),
+            )
+            res.raise_for_status()
+            posts = res.json()
+            if posts:
+                return posts[0]["id"]
+        except Exception as e:
+            log.warning(f"  ⚠️ 슬러그 기반 포스트 조회 실패: {e}")
+
+    return None
+
+
+# ─────────────────────────────
+# 📤 WP 발행 (v4: 포스트 타입 분기, 재발행 지원)
+# ─────────────────────────────
+def publish_to_wp(page: dict, notion: Client, dry_run: bool = False, existing_post_id: int | None = None) -> dict:
     props = page.get("properties", {})
     page_id = page["id"]
 
@@ -566,10 +605,15 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
             log.info(f"  📋 ACF 필드: {acf_data}")
 
     if dry_run:
-        log.info(f"  [DRY-RUN] 발행 생략 — 제목: {title}, 발행타입: {post_type}, 카테고리: {wp_cat}, 태그: {tag_names}")
+        action = "재발행" if existing_post_id else "발행"
+        log.info(f"  [DRY-RUN] {action} 생략 — 제목: {title}, 발행타입: {post_type}, 카테고리: {wp_cat}, 태그: {tag_names}")
         return {"link": "https://dry-run.local/"}
 
-    res = requests.post(f"{WP_URL}{endpoint}", headers=wp_headers(), json=post_data)
+    if existing_post_id:
+        log.info(f"  🔄 기존 포스트 업데이트 중 (ID: {existing_post_id})")
+        res = requests.post(f"{WP_URL}{endpoint}/{existing_post_id}", headers=wp_headers(), json=post_data)
+    else:
+        res = requests.post(f"{WP_URL}{endpoint}", headers=wp_headers(), json=post_data)
     res.raise_for_status()
     return res.json()
 
@@ -582,13 +626,18 @@ def update_notion_status(notion: Client, page_id: str, status: str, wp_url: str 
 
 
 def fetch_pending_pages(notion: Client) -> list:
-    """페이지네이션 처리로 대기 중인 글을 모두 가져옴 (100건 초과 대응)."""
+    """페이지네이션 처리로 발행/재발행 대기 중인 글을 모두 가져옴 (100건 초과 대응)."""
     results = []
     cursor = None
     while True:
         resp = notion.databases.query(
             database_id=NOTION_DB_ID,
-            filter={"property": "상태", "status": {"equals": TRIGGER_STATUS}},
+            filter={
+                "or": [
+                    {"property": "상태", "status": {"equals": TRIGGER_STATUS}},
+                    {"property": "상태", "status": {"equals": REPUBLISH_STATUS}},
+                ]
+            },
             start_cursor=cursor,
             page_size=100,
         )
@@ -609,14 +658,30 @@ def run_once(notion: Client, dry_run: bool = False) -> None:
     success, fail = 0, 0
 
     for page in pages:
-        title = "".join(rt["plain_text"] for rt in page["properties"].get("이름", {}).get("title", []))
+        props = page["properties"]
+        title = "".join(rt["plain_text"] for rt in props.get("이름", {}).get("title", []))
         page_id = page["id"]
-        log.info(f"\n▶ 처리 중: {title}")
+        page_status = (props.get("상태", {}).get("status") or {}).get("name", "")
+        is_republish = (page_status == REPUBLISH_STATUS)
+
+        log.info(f"\n▶ {'재발행' if is_republish else '신규 발행'} 처리 중: {title}")
 
         try:
-            wp_post = publish_to_wp(page, notion, dry_run=dry_run)
+            existing_post_id = None
+            if is_republish:
+                wp_url_existing = (props.get("워드프레스 URL") or {}).get("url", "")
+                if not wp_url_existing:
+                    raise ValueError("재발행 실패: 노션에 워드프레스 URL이 없습니다")
+                post_type = get_post_type_from_page(props)
+                endpoint = POST_TYPE_CONFIG[post_type]["endpoint"]
+                existing_post_id = resolve_wp_post_id(wp_url_existing, endpoint)
+                if not existing_post_id:
+                    raise ValueError(f"재발행 실패: 기존 포스트를 찾을 수 없습니다 (URL: {wp_url_existing})")
+
+            wp_post = publish_to_wp(page, notion, dry_run=dry_run, existing_post_id=existing_post_id)
             wp_url = wp_post["link"]
-            log.info(f"  ✅ WP 발행 완료: {wp_url}")
+            action_name = "재발행" if is_republish else "발행"
+            log.info(f"  ✅ WP {action_name} 완료: {wp_url}")
 
             if not dry_run:
                 update_notion_status(notion, page_id, DONE_STATUS, wp_url)
