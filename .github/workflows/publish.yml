@@ -6,6 +6,10 @@ on:
     # ⚠️ GitHub 부하에 따라 실제 실행은 최대 30~60분 지연될 수 있음
     - cron: '*/5 * * * *'
 
+  push:
+    branches: [main]
+    paths: ['notion_wp_publisher.py']  # 발행 스크립트 변경 시 즉시 실행
+
   workflow_dispatch:  # GitHub 웹에서 수동 실행 버튼
 
 jobs:
