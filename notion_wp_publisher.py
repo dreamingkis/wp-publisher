@@ -214,6 +214,14 @@ def fetch_all_blocks(notion: Client, block_id: str) -> list:
     return blocks
 
 
+def _get_children_html(block: dict, notion: Client) -> str:
+    """has_children이 True인 블록의 자식 콘텐츠를 재귀적으로 가져옴."""
+    if not block.get("has_children", False):
+        return ""
+    children = fetch_all_blocks(notion, block["id"])
+    return blocks_to_html(children, notion)
+
+
 def blocks_to_html(blocks: list, notion: Client) -> str:
     """블록 리스트 → HTML (중첩 블록 재귀 지원)."""
     html_parts = []
@@ -241,23 +249,37 @@ def blocks_to_html(blocks: list, notion: Client) -> str:
             flush_list()
 
         if btype == "paragraph":
-            if text.strip():
-                html_parts.append(f"<p>{text}</p>")
+            inner = text
+            if has_children:
+                inner += _get_children_html(block, notion)
+            if inner.strip():
+                html_parts.append(f"<p>{inner}</p>")
         elif btype in ("heading_1", "heading_2", "heading_3"):
             lvl = btype[-1]
             html_parts.append(f"<h{lvl}>{text}</h{lvl}>")
+            if has_children:
+                html_parts.append(_get_children_html(block, notion))
         elif btype == "bulleted_list_item":
             if list_type != "ul":
                 flush_list()
             list_type = "ul"
-            list_buffer.append(text)
+            li_content = text
+            if has_children:
+                li_content += _get_children_html(block, notion)
+            list_buffer.append(li_content)
         elif btype == "numbered_list_item":
             if list_type != "ol":
                 flush_list()
             list_type = "ol"
-            list_buffer.append(text)
+            li_content = text
+            if has_children:
+                li_content += _get_children_html(block, notion)
+            list_buffer.append(li_content)
         elif btype == "quote":
-            html_parts.append(f"<blockquote><p>{text}</p></blockquote>")
+            inner = text
+            if has_children:
+                inner += _get_children_html(block, notion)
+            html_parts.append(f"<blockquote><p>{inner}</p></blockquote>")
         elif btype == "divider":
             html_parts.append("<hr/>")
         elif btype == "code":
@@ -285,13 +307,60 @@ def blocks_to_html(blocks: list, notion: Client) -> str:
                 html_parts.append("</figure>")
         elif btype == "callout":
             icon = bdata.get("icon", {}).get("emoji", "💡")
-            html_parts.append(f'<div class="callout"><span>{icon}</span><div>{text}</div></div>')
-        elif btype == "toggle":
-            children_html = ""
+            inner = text
             if has_children:
-                children = fetch_all_blocks(notion, block["id"])
-                children_html = blocks_to_html(children, notion)
+                inner += _get_children_html(block, notion)
+            html_parts.append(f'<div class="callout"><span>{icon}</span><div>{inner}</div></div>')
+        elif btype == "toggle":
+            children_html = _get_children_html(block, notion)
             html_parts.append(f"<details><summary>{text}</summary>{children_html}</details>")
+        elif btype == "column_list":
+            # column_list의 자식은 column 블록들 → 각 column의 내용을 순서대로 렌더링
+            columns = fetch_all_blocks(notion, block["id"])
+            html_parts.append('<div class="wp-block-columns">')
+            for col in columns:
+                html_parts.append('<div class="wp-block-column">')
+                col_children = fetch_all_blocks(notion, col["id"])
+                html_parts.append(blocks_to_html(col_children, notion))
+                html_parts.append("</div>")
+            html_parts.append("</div>")
+        elif btype == "to_do":
+            checked = bdata.get("checked", False)
+            marker = "☑" if checked else "☐"
+            html_parts.append(f"<p>{marker} {text}</p>")
+        elif btype == "synced_block":
+            # 동기화 블록: 자식 콘텐츠를 그대로 렌더링
+            if has_children:
+                html_parts.append(_get_children_html(block, notion))
+        elif btype == "bookmark":
+            url = bdata.get("url", "")
+            cap = rich_text_to_html(bdata.get("caption", []))
+            if url:
+                label = cap if cap else url
+                html_parts.append(f'<p><a href="{url}" target="_blank">{label}</a></p>')
+        elif btype == "embed":
+            url = bdata.get("url", "")
+            if url:
+                html_parts.append(f'<figure><iframe src="{url}" frameborder="0"></iframe></figure>')
+        elif btype == "video":
+            url = (bdata.get("file") or bdata.get("external") or {}).get("url", "")
+            if url:
+                if "youtube" in url or "youtu.be" in url or "vimeo" in url:
+                    html_parts.append(f'<figure><iframe src="{url}" frameborder="0" allowfullscreen></iframe></figure>')
+                else:
+                    html_parts.append(f'<figure><video src="{url}" controls></video></figure>')
+        elif btype == "file" or btype == "pdf":
+            url = (bdata.get("file") or bdata.get("external") or {}).get("url", "")
+            cap = rich_text_to_html(bdata.get("caption", []))
+            if url:
+                label = cap if cap else (bdata.get("name", "") or "파일 다운로드")
+                html_parts.append(f'<p><a href="{url}" target="_blank">{label}</a></p>')
+        elif btype == "link_preview":
+            url = bdata.get("url", "")
+            if url:
+                html_parts.append(f'<p><a href="{url}" target="_blank">{url}</a></p>')
+        else:
+            log.debug(f"  ⚠️ 미지원 블록 타입: {btype}")
 
     flush_list()
     return "\n".join(html_parts)
@@ -299,7 +368,17 @@ def blocks_to_html(blocks: list, notion: Client) -> str:
 
 def notion_blocks_to_html(notion: Client, page_id: str) -> tuple[str, list]:
     blocks = fetch_all_blocks(notion, page_id)
+    if not blocks:
+        log.warning(f"  ⚠️ 페이지 블록이 0개입니다 (page_id: {page_id}). "
+                     "노션 Integration의 'Read content' 권한을 확인하세요.")
+    else:
+        block_types = [b["type"] for b in blocks]
+        log.info(f"  📦 블록 {len(blocks)}개 로드됨: {dict((t, block_types.count(t)) for t in set(block_types))}")
     html = blocks_to_html(blocks, notion)
+    if not html.strip():
+        log.warning(f"  ⚠️ 변환된 HTML 본문이 비어 있습니다! 블록 수: {len(blocks)}")
+    else:
+        log.info(f"  📄 HTML 변환 완료: {len(html)}자")
     return html, blocks
 
 
@@ -419,6 +498,10 @@ def publish_to_wp(page: dict, notion: Client, dry_run: bool = False) -> dict:
     log.info(f"  📝 블록 변환 중: {title}")
     log.info(f"  📦 발행타입: {post_type} → {endpoint}")
     content_html, blocks = notion_blocks_to_html(notion, page_id)
+
+    if not content_html.strip():
+        raise ValueError(f"본문 HTML이 비어 있습니다. 노션 페이지에 콘텐츠가 없거나 "
+                         f"Integration 'Read content' 권한을 확인하세요. (page_id: {page_id})")
 
     seo = generate_seo_meta(title, content_html, meta_desc_input, focus_kw_input)
     log.info(f"  🔍 SEO 키워드: {seo['focus_keyword']}")
