@@ -466,7 +466,7 @@ def get_post_type_from_page(props: dict) -> str:
 # ─────────────────────────────
 def resolve_wp_post_id(wp_url: str, endpoint: str) -> int | None:
     """워드프레스 URL에서 기존 포스트 ID를 조회합니다."""
-    from urllib.parse import urlparse, parse_qs
+    from urllib.parse import urlparse, parse_qs, unquote
 
     parsed = urlparse(wp_url)
 
@@ -481,8 +481,11 @@ def resolve_wp_post_id(wp_url: str, endpoint: str) -> int | None:
     # Case 2: /slug/ 형식 → REST API로 슬러그 기반 조회
     path = parsed.path.strip("/")
     slug = path.split("/")[-1] if path else ""
+    # 퍼센트 인코딩 디코딩 (한글 슬러그 이중 인코딩 방지)
+    slug = unquote(slug)
 
     if slug:
+        log.info(f"  🔍 슬러그로 기존 포스트 조회: {slug}")
         try:
             res = requests.get(
                 f"{WP_URL}{endpoint}",
@@ -492,7 +495,10 @@ def resolve_wp_post_id(wp_url: str, endpoint: str) -> int | None:
             res.raise_for_status()
             posts = res.json()
             if posts:
+                log.info(f"  ✅ 기존 포스트 발견 (ID: {posts[0]['id']})")
                 return posts[0]["id"]
+            else:
+                log.warning(f"  ⚠️ 슬러그 '{slug}'에 해당하는 포스트 없음")
         except Exception as e:
             log.warning(f"  ⚠️ 슬러그 기반 포스트 조회 실패: {e}")
 
